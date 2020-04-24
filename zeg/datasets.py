@@ -7,6 +7,7 @@ import sys
 from datetime import datetime
 from tempfile import mkstemp
 import uuid
+import gzip
 
 from colorama import Fore, Style
 
@@ -36,72 +37,6 @@ def get(log, session, args):
     log.print_json(response_json, "dataset", "get")
 
 
-def update(log, session, args):
-    configuration = config.parse_args(args, log)
-    update_from_dict(log, session, configuration)
-
-
-def update_from_dict(log, session, configuration):
-    """Update a data set."""
-    url_url = "{}imagesets/{}/image_url".format(
-        http.get_api_url(configuration['url'], configuration['project']),
-        configuration['id'])
-    replace_url = "{}datasets/{}/".format(
-        http.get_api_url(configuration['url'], configuration['project']),
-        configuration['id'])
-
-    log.debug('POST: {}'.format(url_url))
-    # get update config
-    if 'file_config' in configuration:
-        (
-            file_path,
-            extension,
-            file_mime
-        ) = _file_type_update(log, configuration['file_config'])
-    elif 'sql_config' in configuration:
-        (
-            file_path,
-            extension,
-            file_mime
-        ) = _sql_type_update(log, configuration['sql_config'])
-
-    log.debug("File path: {}".format(file_path))
-    log.debug("File extension: {}".format(extension))
-    log.debug("File mime: {}".format(file_mime))
-    file_name = os.path.basename(file_path)
-
-    with open(file_path) as f:
-        blob_id = str(uuid.uuid4())
-        info = {
-            "image": {
-                "blob_id": blob_id,
-                "name": file_name,
-                "size": os.path.getsize(file_path),
-                "mimetype": file_mime
-            }
-        }
-        create = http.post_json(session, url_url, info)
-        # Post file to storage location
-        url = create["url"]
-        if url.startswith("/"):
-            url = 'https://storage.googleapis.com{}'.format(url)
-        log.debug('PUT (file content): {}'.format(url))
-        data = f.read()
-        http.put(session, url, data, file_mime)
-
-        # confirm
-        log.debug('GET (dataset): {}'.format(replace_url))
-        current = http.get(session, replace_url)["dataset"]
-        current["source"].pop("schema", None)
-        current["source"]["upload"] = {
-            "name": file_name,
-        }
-        current["source"]["blob_id"] = blob_id
-        log.debug('PUT (dataset): {}'.format(replace_url))
-        http.put_json(session, replace_url, current)
-        log.print_json(current, "dataset", "update")
-
-
 def delete(log, args):
     """Delete an data set."""
     log('dataset id: {highlight}{id}{reset}',
@@ -109,6 +44,87 @@ def delete(log, args):
         id=args.id,
         reset=Style.RESET_ALL)
     log.warn('delete dataset command coming soon.')
+
+
+def update(log, session, args):
+    configuration = config.parse_args(args, log)
+    update_from_dict(log, session, configuration)
+
+
+def update_from_dict(log, session, configuration):
+    """Update a data set."""
+    if 'file_config' in configuration:
+        file_details = _file_type_update(log, configuration['file_config'])
+    elif 'sql_config' in configuration:
+        file_details = _sql_type_update(log, configuration['sql_config'])
+
+    (file_path, extension, file_mime) = file_details
+    log.debug("File path: {}".format(file_path))
+    log.debug("File extension: {}".format(extension))
+    log.debug("File mime: {}".format(file_mime))
+
+    with open(file_path) as file:
+        if extension == '.gz':
+            with gzip.open(file_path, 'rt') as unzipped_file:
+                _upload_data(
+                    unzipped_file,
+                    file_details,
+                    log,
+                    session,
+                    configuration,
+                )
+        else:
+            _upload_data(
+                file,
+                file_details,
+                log,
+                session,
+                configuration
+            )
+
+
+def _upload_data(file, file_details, log, session, configuration):
+    (file_path, extension, file_mime) = file_details
+    url_url = "{}imagesets/{}/image_url".format(
+        http.get_api_url(configuration['url'], configuration['project']),
+        configuration['id'],
+    )
+    replace_url = "{}datasets/{}/".format(
+        http.get_api_url(configuration['url'], configuration['project']),
+        configuration['id'],
+    )
+
+    blob_id = str(uuid.uuid4())
+    file_name = os.path.basename(file_path)
+    info = {
+        "image": {
+            "blob_id": blob_id,
+            "name": file_name,
+            "size": os.path.getsize(file_path),
+            "mimetype": file_mime
+        }
+    }
+    create = http.post_json(session, url_url, info)
+    log.debug('POST: {}'.format(url_url))
+    # Post file to storage location
+    url = create["url"]
+    if url.startswith("/"):
+        url = 'https://storage.googleapis.com{}'.format(url)
+    log.debug('PUT (file content): {}'.format(url))
+    data = file.read()
+    http.put(session, url, data, file_mime)
+
+    # confirm
+    log.debug('GET (dataset): {}'.format(replace_url))
+    current = http.get(session, replace_url)["dataset"]
+    current["source"].pop("schema", None)
+    current["source"]["upload"] = {
+        "name": file_name,
+    }
+    current["source"]["blob_id"] = blob_id
+    log.debug('PUT (dataset): {}'.format(replace_url))
+    http.put_json(session, replace_url, current)
+    log.print_json(current, "dataset", "update")
 
 
 def _file_type_update(log, file_config):
